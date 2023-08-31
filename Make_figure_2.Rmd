@@ -1,0 +1,98 @@
+---
+title: "Plot_EVI_and_migration_curve"
+output: html_document
+date: "2023-05-25"
+---
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "C:/Users/caada/OneDriveColostate/Passage_phenology/Ecology_letters_scripts")
+```
+
+```{r read in data}
+data = readRDS("data.Rda")
+```
+
+```{r load packages}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r read in EVI data}
+EVI = read_excel("EVI_MOD13A1_buffers_all.xls")
+```
+
+```{r get phenology date data}
+data = readRDS("data.Rda")
+data2 = data %>% dplyr::select(site, year, mean_greenup, mean_midgreenup, mean_maturity, mean_peak, mean_senescence, mean_midgreendown, mean_dormancy, mean_greenup_EVI, mean_midgreenup_EVI, mean_maturity_EVI, mean_peak_EVI, mean_senescence_EVI, mean_midgreendown_EVI, mean_dormancy_EVI)
+data2 = data2 %>% rename(
+ "greenup" = "mean_greenup", "midgreenup" = mean_midgreenup, "maturity" = mean_maturity, "peak" = mean_peak, "senescence" = mean_senescence, "midgreendown" = mean_midgreendown, "dormancy" = mean_dormancy)
+
+```
+
+```{r plot EVI curve for a buffer}
+buffers = unique(EVI$site)
+buffer = buffers[1]
+years = unique(EVI$year)
+y = years[10]
+
+plot_EVI_passage = function(buffer, y, letter) {
+
+  #get phenology dates from site
+  site_phen = data2 %>% filter(year == y, site == buffer)
+  phen_dates =  unlist(as.vector(as.data.frame(site_phen)[1,3:9]))
+  phen_EVI = unlist(as.vector(as.data.frame(site_phen)[1,10:16]))
+  phen_data = data.frame(DOY = phen_dates, EVI = phen_EVI)
+  peak_EVI = phen_data$EVI[4]
+  phen_data = phen_data %>% mutate(EVI_prop = EVI/peak_EVI, names = rownames(phen_data))
+  
+  #get raw EVI data from site
+  site_data = EVI %>% filter(site == buffer, year == y) #get site data
+  site_data[site_data == -9999] = NA #turn fill values to NA
+  site_data = site_data %>% mutate(EVI_prop = EVI_mean/peak_EVI)
+  
+  #get passage dates from site
+  passage_data = data %>% dplyr::select(year, site, spring_q10, spring_q50, spring_q90, fall_q10, fall_q50, fall_q90)
+  passage_data = passage_data %>% filter(year == y, site == buffer)
+  passage_dates =  unlist(as.vector(as.data.frame(passage_data)[3:8]))
+  passage_data = data.frame(quantile = c("10%", "50%", "90%", "10%", "50%", "90%"),
+                            season = c("spring", "spring", "spring", "fall", "fall", "fall"),
+                            date = passage_dates)
+  
+    col_10 = "#CC79A7"
+    col_50 = "#0072B2"
+    col_90 = "#D55E00"
+  
+  d = data %>% filter(site == buffer)
+  dlat = first(d$lat)
+  lab = paste(buffer, " \n ", round(dlat,2), " N", " \n ", y, sep = "")
+    
+  #plot
+  pl = ggplot(data = site_data, aes(x = DOY_EVI, y = EVI_prop))+
+    geom_vline(data = passage_data, aes(xintercept = date, col = quantile, linetype = season), size = 1)+
+    geom_smooth(method = "gam", se = FALSE, col = "#E69F00", alpha = 0.7)+
+    geom_point(col = "#56B4E9")+
+    geom_point(data = phen_data, aes(x = DOY, y = EVI_prop), col ="#009E73", size = 3)+
+    geom_label_repel(aes(label = names, x = DOY, y = EVI_prop), data = phen_data, col = "#009E73", alpha = 0.75, nudge_x = c(-3,-3,-3,0,3,3,3), direction = c("x"))+
+      scale_color_manual(values = c("10%" = col_10, "50%" = col_50, "90%" = col_90), name = "Passage \n quantile")+
+    scale_linetype_manual(values=c("spring" = "solid", "fall" = "dashed"),guide = guide_legend(title = "Season", label.position = "top"))+
+    xlab("Date")+
+    ylab("Proportion of peak EVI2")+
+    scale_x_continuous(breaks = c(32, 91, 152, 213, 274, 335),
+      label = c("Feb 1", "Apr 1", "Jun 1", "Aug 1", "Oct 1", "Dec 1"))+
+    annotate("text", x = 30, y = 0.9, label = lab)+
+    ggtitle(letter)+
+    theme_classic()
+    
+  return(pl)
+
+}
+```
+
+
+```{r plot EVI passage}
+North_plot = plot_EVI_passage("KABR", 2007, "b)") 
+South_plot = plot_EVI_passage("KCRP", 2007, "a)")+ theme(legend.position = "none")
+
+grid.arrange(grobs = list(South_plot, North_plot), ncol = 2, widths = c(3,3.5))
+```
