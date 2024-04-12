@@ -1,0 +1,1447 @@
+---
+title: "Adams_2024_Ecography_script"
+output: html_document
+date: "2023-08-31"
+---
+NOTE: Coefficient estimates will differ slightly every time you run them models, and may not exactly match those reported in the publication
+
+#Setup
+```{r, setup}
+knitr::opts_knit$set(root.dir = "#insert working directory here")
+#change to your own root directory
+```
+
+```{r load packages}
+
+library(ggplot2)
+library(lme4)
+library(ggeffects)
+library(grid)
+library(gridExtra)
+library(sjPlot)
+library(arm)
+library(ggrepel)
+library(grid)
+library(gridExtra)
+library(buildmer)
+library(stringr)
+library(emmeans)
+library(readxl)
+library(MuMIn)
+library(dplyr)
+library(DHARMa)
+library(nlme)
+library(terra)
+library(sf)
+library(spdep)
+```
+
+
+```{r read in data}
+data = readRDS("data.Rda")
+mid_lat = 37
+min_lat = 26
+max_lat = 48
+site = data$site
+year = data$year
+lat = data$lat
+lon= data$lon
+
+site_means = data %>% group_by(site) %>% summarise(lat = mean(lat), lon = mean(lon), 
+                                                            spring_passage_10 = mean(spring_q10),
+                                                            spring_passage_50 = mean(spring_q50),
+                                                            spring_passage_90 = mean(spring_q90),
+                                                   fall_passage_10 = mean(fall_q10),
+                                                   fall_passage_50 = mean(fall_q50),
+                                                   fall_passage_90 = mean(fall_q90))
+
+```
+
+```{r functions for plotting}
+
+make_polygon_df = function(x_values, upper_CI, lower_CI) {
+  data.frame(values = rep(1, length(x_values)), x =  c(x_values, rev(x_values)), y = c(upper_CI, rev(lower_CI)))
+}
+
+make_polygon_df_rev = function(x_values, upper_CI, lower_CI) {
+  data.frame(values = rep(1, length(x_values)), x =  c(rev(x_values), x_values), y = c(rev(upper_CI), lower_CI))
+}
+
+make_polygon_df_group = function(x_values, upper_CI, lower_CI, group) {
+  data.frame(values = rep(1, length(x_values)), x =  c(x_values, rev(x_values)), y = c(upper_CI, rev(lower_CI)), group = c(group, rev(group)))
+}
+
+make_grobs = function(plot_list){
+  plots <- plot_list
+  grobs <- list()
+  widths <- list()
+  
+  for (i in 1:length(plots)){
+      grobs[[i]] <- ggplotGrob(plots[[i]])
+      widths[[i]] <- grobs[[i]]$widths[2:5]
+  }
+  
+  maxwidth <- do.call(grid::unit.pmax, widths)
+  
+  for (i in 1:length(grobs)){
+       grobs[[i]]$widths[2:5] <- as.list(maxwidth)
+  }
+  
+  grobs
+}
+
+ make_slope_mat = function(slopes){
+   #changes names
+   rownames(slopes)[which(rownames(slopes) == "I(lat^2)")] = "lat^2"
+   rownames(slopes)[which(rownames(slopes) == "I(lon^2)")] = "lon^2"
+   #create empty slope_mat
+   slope_mat = data.frame(var = c("lat", "lat^2", "lon", "lon^2", "lat:lon"), "Est." = rep(NA, 5), "SE" = rep(NA,5))
+   #fill in slope_mat
+   ind = match(slope_mat$var, rownames(slopes))
+   slope_mat[, 2:3] = slopes[ind,1:2]
+   slope_mat$var = c("lat", "lat^2", "lon", "lon^2", "lat:lon")
+   slope_mat
+ }
+ 
+   col_phen_1 = "#009E73"
+  col_phen_2 = "#56B4E9"
+  col_phen_3 = "#999999"
+  col_10 = "#CC79A7"
+  col_50 = "#0072B2"
+  col_90 = "#E69F00"
+  
+firstup <- function(x) {
+  substr(x, 1, 1) <- toupper(substr(x, 1, 1))
+  x
+}
+```
+
+```{r make columns for days since LSP events}
+data = data %>% mutate(spring_q10_ds_greenup = spring_q10 - mean_greenup,
+                       spring_q50_ds_greenup = spring_q50 - mean_greenup,
+                       spring_q90_ds_greenup = spring_q90 - mean_greenup,
+                       spring_q10_ds_maturity = spring_q10 - mean_maturity,
+                       spring_q50_ds_maturity = spring_q50 - mean_maturity,
+                       spring_q90_ds_maturity = spring_q90 - mean_maturity,
+                       spring_q10_ds_midgreenup = spring_q10 - mean_midgreenup,
+                       spring_q50_ds_midgreenup = spring_q50 - mean_midgreenup,
+                       spring_q90_ds_midgreenup = spring_q90 - mean_midgreenup)
+
+data = data %>% mutate(fall_q10_ds_senescence = fall_q10 - mean_senescence,
+                       fall_q50_ds_senescence = fall_q50 - mean_senescence,
+                       fall_q90_ds_senescence = fall_q90 - mean_senescence,
+                       fall_q10_ds_dormancy = fall_q10 - mean_dormancy,
+                       fall_q50_ds_dormancy = fall_q50 - mean_dormancy,
+                       fall_q90_ds_dormancy = fall_q90 - mean_dormancy,
+                       fall_q10_ds_midgreendown = fall_q10 - mean_midgreendown,
+                       fall_q50_ds_midgreendown = fall_q50 - mean_midgreendown,
+                       fall_q90_ds_midgreendown = fall_q90 - mean_midgreendown,
+                       )
+
+data_8 = data %>% filter(L1_code == "8")
+data_9 = data %>% filter(L1_code == "9")
+```
+
+
+
+#Model LSC and migration dates as a function of latitude
+##Function to select relationship with lat/lon
+```{r choose model with lowest AIC}
+
+metric_name = "spring_q10_ds_greenup"
+metric_translation = "passage date minus greenup date"
+
+choose_model = function(metric_name, metric_translation) {
+    options(na.action = na.fail)
+  
+  #rename the column with the variable you want to analyze, changing to "response"
+  m_data = data
+  colnames(m_data)[which(colnames(m_data) == metric_name)] = "response"
+  
+  #add columns for lat2, lon2, and latlon
+  m_data = m_data %>% mutate("lat2" = lat^2, "lon2" = lon^2, "latlon" = lat*lon, "latlon2" = (lat*lon)^2)
+  
+  #remove NA values
+  m_data= m_data[!is.na(m_data$response),]
+  
+  #create a global model with all lat/lon terms
+  m_global = lmer(response ~ (1|site) + (1|year) + lat + lon + I(lat^2) + I(lon^2) + lat*lon, data = m_data, REML = FALSE)
+  m_dredged = dredge(m_global, beta = "none", evaluate = TRUE, rank = "AICc")
+  #m_chosen = get.models(m_dredged, 1)[[1]]
+  m_chosen = get.models(m_dredged, subset = delta < 2)
+  if (length(m_chosen) == 1) {m_chosen = m_chosen[[1]]} else
+  {
+    count_vars = function(x) {
+      str_count(as.character(formula(x))[3], "\\+") - 1
+    }
+    
+    var_nums = unlist(lapply(m_chosen, count_vars))
+    ind = which(var_nums == min(var_nums))[1]
+    m_chosen = m_chosen[[ind]]
+  }
+
+  
+  #get values for lat_chosen, lon_chosen, and latlon_chosen
+  form = formula(m_chosen)
+  lat_lin_chosen = (sum(grepl("lat +", form)) > 0)
+  lat_quad_chosen = (sum(grepl("\\(lat\\^2)", form)) > 0)
+  lon_lin_chosen = (sum(grepl("lon +", form)) > 0)
+  lon_quad_chosen = (sum(grepl("\\(lon\\^2)", form)) > 0)
+  latlon_chosen = (sum(grepl("lat:lon", form)) > 0)
+  
+  if(lat_lin_chosen == TRUE & lat_quad_chosen == TRUE) {lat_chosen = "first & second"
+  } else if (lat_lin_chosen == TRUE & lat_quad_chosen == FALSE) {lat_chosen = "first"
+  } else if (lat_lin_chosen == FALSE & lat_quad_chosen == TRUE) {lat_chosen = "second"
+  } else (lat_chosen = "none")
+  
+  if(lon_lin_chosen == TRUE & lon_quad_chosen == TRUE) {lon_chosen = "first & second"
+  } else if (lon_lin_chosen == TRUE & lon_quad_chosen == FALSE) {lon_chosen = "first"
+  } else if (lon_lin_chosen == FALSE & lon_quad_chosen == TRUE) {lon_chosen = "second"
+  } else (lon_chosen = "none")
+  
+  #If latitude is not in the formula, add it
+  if(sum(grepl("lat", form)) == 0) {
+  m_dredged = dredge(m_global, beta = "none", evaluate = TRUE, rank = "AICc", subset = expression ("lat" | "I(lat^2)"))
+  #m_chosen = get.models(m_dredged, 1)[[1]]
+  m_chosen_2 = get.models(m_dredged, subset = delta < 2)
+  if (length(m_chosen_2) == 1) {m_chosen_2 = m_chosen_2[[1]]} else
+  {
+    count_vars = function(x) {
+      str_count(as.character(formula(x))[3], "\\+") - 1
+    }
+    
+    var_nums = unlist(lapply(m_chosen_2, count_vars))
+    ind = which(var_nums == min(var_nums))[1]
+    m_chosen_2 = m_chosen_2[[ind]]
+  }
+  } else {m_chosen_2 = m_chosen}
+  
+  #determine if m_chosen_2 has spatial autocorrelation in the residuals
+  resids = predict(m_chosen_2) - m_data$response
+  m_data_vect = vect(m_data, geom = c("lon", "lat"), crs = "+proj=longlat +datum=WGS84")
+  m_data_sp = as(m_data_vect, "Spatial")
+  nb = dnearneigh(m_data_sp, d1 = 1, d2 = 2000)
+  #generate distance-weighted neighbors object
+  nb.w = nb2listw(nb, glist = NULL, style = "W", zero.policy = FALSE)
+  #conduct 2-sided Moran's I test
+  moransI_test = moran.mc(resids, nb.w, 999, zero.policy = FALSE)
+  moransI_test_stat = moransI_test$statistic
+  moransI_p = moransI_test$p.value
+  
+  resid.lag = lag.listw(nb.w, resids)
+  M = lm(resid.lag ~ resids)
+  plot(resid.lag ~ resids, pch=20)
+  abline(M, col = "red")
+  
+  if(lon_chosen == "none" & latlon_chosen == FALSE){
+    m_preds = ggpredict(m_chosen_2, terms = c("lat [26:48]")) } else {
+        m_preds = ggpredict(m_chosen_2, terms = c("lat [26:48]", "lon [-95.93]"))
+    }
+ m_preds_data = data.frame("lat" = m_preds$x, "preds" = m_preds$predicted, "conf.low" = m_preds$conf.low, "conf.high" = m_preds$conf.high)
+  m_poly = make_polygon_df(m_preds_data$lat, m_preds_data$conf.low, m_preds_data$conf.high)
+  
+  #add longitude and lat*lon if necessary
+  if(lon_chosen == "none" & latlon_chosen == FALSE){
+    preds = ggpredict(m_chosen_2, terms = c("lat [26:48]"))
+    preds_data = data.frame("lat" = preds$x, "preds" = preds$predicted, "conf.low" = preds$conf.low, "conf.high" = preds$conf.high)
+    preds_data_lon = c(rep(1, nrow(preds_data)), rep(2, nrow(preds_data)), rep(3, nrow(preds_data)))
+    preds_data = rbind(preds_data, preds_data, preds_data)
+    preds_data = cbind(preds_data, preds_data_lon)
+    colnames(preds_data)[5] = "lon"
+  } else {
+  #make predictions across latitudes for three longitudes
+  preds = ggpredict(m_chosen_2, terms = c("lat [26:48]", "lon[-100, -95.5, -91]"))
+  preds_data = data.frame("lat" = preds$x, "preds" = preds$predicted, "conf.low" = preds$conf.low, "conf.high" = preds$conf.high, "lon" = preds$group)
+  #change groups to longitude values
+  preds_data$lon = as.numeric(preds_data$lon)
+  }
+  #}
+  
+  preds_data$lon[preds_data$lon == 1] = -100
+  preds_data$lon[preds_data$lon == 2] = -95.5
+  preds_data$lon[preds_data$lon == 3] = -91
+  preds_data$lon = as.factor(as.character(preds_data$lon))
+  #make polygons for each longitude
+  preds_data_100 = preds_data %>% filter(lon == -100)
+  poly_100 = make_polygon_df(preds_data_100$lat, preds_data_100$conf.low, preds_data_100$conf.high)
+  preds_data_95.5 = preds_data %>% filter(lon == -95.5)
+  poly_95.5 = make_polygon_df(preds_data_95.5$lat, preds_data_95.5$conf.low, preds_data_95.5$conf.high)
+  preds_data_91 = preds_data %>% filter(lon == -91)
+  poly_91 = make_polygon_df(preds_data_91$lat, preds_data_91$conf.low, preds_data_91$conf.high)
+  
+  #get prediction and CI for difference between 48 and 26
+  EMM = emmeans(m_chosen_2, "lat", at = list(lat = c(48,26)))
+  comp = confint(pairs(EMM))
+  pred_dif = comp$estimate
+  pred_dif_low_CI = comp$lower.CL
+  pred_dif_high_CI = comp$upper.CL
+  pred_plus_minus = 1.96*comp$SE
+  
+  if (grepl("EVI", metric_name ) | grepl("rain", metric_name)) {d = 2} else {d = 1}
+  
+  pred_dif_char = paste(round(pred_dif,d), " (", round(pred_dif_low_CI,d), " ", round(pred_dif_high_CI,d), ")", sep = "")
+  pred_pm_char = paste(round(pred_dif,d), " +- ", round(pred_plus_minus,d), sep = "")
+  
+  #get prediction and CI for difference between 48 and 26 at different longitudes
+  EMM_91 = emmeans(m_chosen_2, "lat", at = list(lat = c(48,26), lon = -91))
+  comp_91 = confint(pairs(EMM_91))
+  pred_dif_91 = comp_91$estimate
+  pred_plus_minus_91 = 1.96*comp_91$SE
+  pred_pm_char_91 = paste(round(pred_dif_91,d), " +- ", round(pred_plus_minus_91,d), sep = "")
+  
+  EMM_95.5 = emmeans(m_chosen_2, "lat", at = list(lat = c(48,26), lon = -95.5))
+  comp_95.5 = confint(pairs(EMM_95.5))
+  pred_dif_95.5 = comp_95.5$estimate
+  pred_plus_minus_95.5 = 1.96*comp_95.5$SE
+  pred_pm_char_95.5 = paste(round(pred_dif_95.5,d), " +- ", round(pred_plus_minus_95.5,d), sep = "")
+  
+  EMM_100 = emmeans(m_chosen_2, "lat", at = list(lat = c(48,26), lon = -100))
+  comp_100 = confint(pairs(EMM_100))
+  pred_dif_100 = comp_100$estimate
+  pred_plus_minus_100 = 1.96*comp_100$SE
+  pred_pm_char_100 = paste(round(pred_dif_100,d), " +- ", round(pred_plus_minus_100,d), sep = "")
+
+    lon_pred_mat = c("100°W" =  pred_pm_char_100, "95.5°W" = pred_pm_char_95.5, "91°W" = pred_pm_char_91, "interaction present" = latlon_chosen)
+  
+  #make data for separate plots at each longitude
+  lon_plot_data = list(preds_data, preds_data_100, poly_100, preds_data_95.5, poly_95.5, preds_data_91, poly_91)
+  
+  #make residual v. predicted values plot
+  res_plot_data = m_data
+  res_plot_data$resid = resids
+  res_plot_data$fitted = predict(m_chosen_2)
+  
+  resid_v_fitted_plot = ggplot(res_plot_data, aes(x = fitted, y = resid))+
+    geom_point(aes(col = L1_code))+
+        scale_color_manual("Ecoregion", values = c("9" = col_90, "8" = col_phen_1), labels = c("8" = "Eastern Temperate\nForests", "9" = "Great Plains"))+
+    xlab("Fitted values")+
+    ylab("Residuals")+
+    geom_hline(yintercept = 0)+
+    theme_classic()+
+    theme(legend.position = "none")
+  
+  #make residuals v. lat and lon plots
+  resid_v_lat_plot = ggplot(res_plot_data, aes(x = lat, y = resid))+
+    geom_point(aes(col = L1_code))+
+    scale_color_manual("Ecoregion", values = c("9" = col_90, "8" = col_phen_1), labels = c("8" = "Eastern Temperate\nForests", "9" = "Great Plains"))+
+    xlab("Latitude")+
+    ylab("Residuals")+
+    geom_hline(yintercept = 0)+
+    theme_classic()+
+    #theme(legend.position = c(0.8, 0.8))
+    theme(legend.position = "none", axis.title.y = element_blank())
+  
+  resid_v_lon_plot = ggplot(res_plot_data, aes(x = lon, y = resid))+
+    geom_point(aes(col = L1_code))+
+    scale_color_manual("Ecoregion", values = c("9" = col_90, "8" = col_phen_1), labels = c("8" = "Eastern Temperate\nForests", "9" = "Great Plains"))+
+    xlab("Longitude")+
+    ylab("Residuals")+
+    geom_hline(yintercept = 0)+
+    theme_classic()+
+    theme(legend.position = "none", axis.title.y = element_blank())
+
+  res_plots = grid.arrange(grobs = list(resid_v_fitted_plot, resid_v_lat_plot, resid_v_lon_plot), ncol = 3, top = grid::textGrob(firstup(metric_translation)), bg = "white")
+  
+  return_list = list(m_chosen, m_preds, m_preds_data, m_poly, lat_chosen, lon_chosen, lon_plot_data, pred_dif_char, pred_pm_char, latlon_chosen, lon_pred_mat, metric_name, m_data, res_plots, moransI_p, moransI_test_stat)
+  names(return_list) = c("m_chosen", "m_preds", "m_preds_data", "m_poly", "lat_chosen", "lon_chosen", "lon_plot_data", "pred_dif_char", "pred_pm_char", "latlon_chosen", "lon_pred_mat", "metric_name", "m_data", "res_plots", "moransI_p", "moransI_test_stat")
+  
+  options(na.action = na.omit)
+  return(return_list)
+}
+```
+
+##function to choose model and make plot
+```{r track_plot function with longitude}
+metric_10 = "spring_q10_ds_greenup"
+metric_50 = "spring_q50_ds_greenup"
+metric_90 = "spring_q90_ds_greenup"
+metric_10_translation = "10% passage date minus greenup date"
+metric_50_translation = "50% passage date minus greenup date"
+metric_90_translation = "90% passage date minus greenup date"
+ylab = "Days since greenup"
+season = "spring"
+letter = "(a)"
+include_x_label = TRUE
+include_y_label = TRUE
+start_at_0 = TRUE
+legend = FALSE
+
+#plot metrics across latitudes
+track_plot_lon = function(metric_10, metric_50, metric_90, metric_name, metric_translation, ylab, season, letter, include_x_label, include_y_label, start_at_0, legend) {
+  #START HERE - make sure all of these names match up
+  
+  metric_10_translation = paste(firstup(season), "10%", metric_translation)
+  metric_50_translation = paste(firstup(season), "50%", metric_translation)
+  metric_90_translation = paste(firstup(season), "90%", metric_translation)
+
+if (season == "spring"){
+    passage_date_10 = data$spring_q10
+    passage_date_50 = data$spring_q50
+    passage_date_90 = data$spring_q90
+  } else if (season == "fall") {
+    passage_date_10 = data$fall_q10
+    passage_date_50 = data$fall_q50
+    passage_date_90 = data$fall_q90
+  }
+  
+  lat = data$lat
+  lon = data$lon
+  site = as.factor(data$site)
+  year = as.factor(data$year)
+  
+  pred_data = data.frame(lat = lat, lon = lon)
+  
+    if (grepl("EVI", metric_10 ) | grepl("rain", metric_10)) {d = 2} else {d = 1}
+
+ make_slope_mat = function(slopes){
+   #changes names
+   rownames(slopes)[which(rownames(slopes) == "I(lat^2)")] = "lat^2"
+   rownames(slopes)[which(rownames(slopes) == "I(lon^2)")] = "lon^2"
+   #create empty slope_mat
+   slope_mat = data.frame(var = c("lat", "lat^2", "lon", "lon^2", "lat:lon"), "Est." = rep(NA, 5), "SE" = rep(NA,5))
+   #fill in slope_mat
+   ind = match(slope_mat$var, rownames(slopes))
+   slope_mat[, 2:3] = slopes[ind,1:2]
+   slope_mat$var = c("lat", "lat^2", "lon", "lon^2", "lat:lon")
+   slope_mat
+ }
+ 
+ results_10 = choose_model(metric_10, metric_10_translation)
+ m_10_data = results_10$m_data
+ m_10 = results_10$m_chosen
+ m_10_preds = results_10$m_preds
+ m_10_preds_data = results_10$m_preds_data
+ m_10_poly = results_10$m_poly
+ slopes = summary(m_10)$coefficients
+ slope_10_mat = make_slope_mat(slopes)
+ metric_10_mat = data.frame(c("lat", "lat^2", "lon", "lon^2", "lat*lon"), slope_10_mat$Est., slope_10_mat$SE)
+ colnames(metric_10_mat) = c("var" , paste("slope_est", "_10", sep = ""),  paste("slope_SE", "_10", sep = ""))
+
+ results_50 = choose_model(metric_50, metric_50_translation)
+ m_50_data = results_50$m_data
+ m_50 = results_50$m_chosen
+ m_50_preds = results_50$m_preds
+ m_50_preds_data = results_50$m_preds_data
+ m_50_poly = results_50$m_poly
+ slopes = summary(m_50)$coefficients
+ slope_50_mat = make_slope_mat(slopes)
+ metric_50_mat = data.frame(results_50$metric_name, slope_50_mat$Est., slope_50_mat$SE)
+ colnames(metric_50_mat) = c("var", paste("slope_est", "_50", sep = ""),  paste("slope_SE", "_50", sep = ""))
+
+ results_90 = choose_model(metric_90, metric_90_translation)
+ m_90_data = results_90$m_data
+ m_90 = results_90$m_chosen
+ m_90_preds = results_90$m_preds
+ m_90_preds_data = results_90$m_preds_data
+ m_90_poly = results_90$m_poly
+ slopes = summary(m_90)$coefficients
+ slope_90_mat = make_slope_mat(slopes)
+ metric_90_mat = data.frame(results_90$metric_name, slope_90_mat$Est., slope_90_mat$SE)
+ colnames(metric_90_mat) = c("var", paste("slope_est", "_90", sep = ""),  paste("slope_SE", "_90", sep = ""))
+ 
+ #get residual plots
+ res_plots_10 = results_10$res_plots
+ res_plots_50 = results_50$res_plots
+ res_plots_90 = results_90$res_plots
+ res_plots = list(results_10$res_plots, results_50$res_plots, results_90$res_plots)
+ 
+ #get moransI p-values and test statistics
+ moransI_p = c(results_10$moransI_p, results_50$moransI_p, results_90$moransI_p)
+ moransI_test_stat = c(results_10$moransI_test_stat, results_50$moransI_test_stat, results_90$moransI_test_stat)
+ 
+  col_10 = "#CC79A7"
+  col_50 = "#0072B2"
+  col_90 = "#E69F00"
+  
+  data_df = data.frame(data)
+  m_10_data = data_df[,which(colnames(data) == metric_10)]
+  m_50_data = data_df[,which(colnames(data) == metric_50)]
+  m_90_data = data_df[,which(colnames(data) == metric_90)]
+  
+  data3 = data.frame("site" = data$site, "lat" = data$lat, "lon" = data$lon, "metric_10" = as.vector(m_10_data), "metric_50" = as.vector(m_50_data), "metric_90" = as.vector(m_90_data))
+  site_means = data3 %>% group_by(site) %>% dplyr::summarize(lat = mean(lat), lon = mean(lon),
+                                                 metric_10 = mean(metric_10, na.rm = TRUE),
+                                                 metric_50 = mean(metric_50, na.rm = TRUE),
+                                                 metric_90 = mean(metric_90, na.rm = TRUE)
+                                                 )
+m_10_preds_data_2 = data.frame(m_10_preds_data, "passage" = "10%")
+m_50_preds_data_2 = data.frame(m_50_preds_data, "passage" = "50%")
+m_90_preds_data_2 = data.frame(m_90_preds_data, "passage" = "90%")
+all_preds_data = rbind(m_10_preds_data_2, m_50_preds_data_2, m_90_preds_data_2)
+
+if(season == "spring"){
+  data_ends = all_preds_data %>% filter(lat == quantile(all_preds_data$lat, 0.66))} else {
+  data_ends = all_preds_data %>% filter(lat == quantile(all_preds_data$lat, 0.33))  
+  }
+
+site_means_10 = data.frame(site_means[,1:4], quant = "10%")
+site_means_50 = data.frame(site_means[,c(1:3,5)], quant = "50%")
+site_means_90 = data.frame(site_means[,c(1:3,6)], quant = "90%")
+colnames(site_means_10)[4] = colnames(site_means_50)[4] = colnames(site_means_90)[4] = "metric"
+site_means_all = rbind(site_means_10, site_means_50, site_means_90)
+site_means_all$passage = site_means_all$quant
+
+plot_all = ggplot(all_preds_data, aes(x = lat, y = preds, group = passage))+
+    theme_classic()+
+    geom_line(aes(color = passage, linetype = passage))+
+    geom_point(aes(x = lat, y = metric, color = passage), data = site_means_all)+
+    geom_polygon(data = m_10_poly, aes(x=x, y=y, group = NA), fill = col_10, colour = NA, alpha = 0.5)+
+    geom_polygon(data = m_50_poly, aes(x=x, y=y, group = NA), fill = col_50, colour = NA, alpha = 0.5)+
+    geom_polygon(data = m_90_poly, aes(x=x, y=y, group = NA), fill = col_90, colour = NA, alpha = 0.5)+
+    xlab("Latitude (°N)")+
+    ylab(ylab)+
+    scale_color_manual(values = c("10%" = col_10, "50%" = col_50, "90%" = col_90), name = "Passage quantile")+
+  scale_linetype_manual(values = c("10%" = "solid", "50%" = "longdash", "90%" = "dotdash"), name = "Passage quantile")+
+    #geom_label_repel(aes(label = passage, col = passage), data = data_ends, nudge_x = 3, alpha = 0.75)+
+  ggtitle(letter)+
+  theme(plot.title = element_text(size = 10), text = element_text(size = 10), legend.position = c(0.15, 0.15), legend.key.width = unit(15, units = "mm"), legend.key.height = unit(3, "mm"))+
+  labs(color = "Passage quantile", linetype = "Passage quantile")
+  
+
+#customize plot
+if(include_x_label == FALSE) {plot_all = plot_all + xlab("")}
+if(include_y_label == FALSE) {plot_all = plot_all + ylab("")}
+if(start_at_0 == TRUE) {plot_all = plot_all + expand_limits(y=0)}
+if(season == "fall") {plot_all = plot_all + scale_x_reverse()}
+if(legend == FALSE) {plot_all = plot_all + theme(legend.position = "none")}
+
+
+  metric_mat = inner_join(metric_10_mat, metric_50_mat, by = "var")
+  metric_mat = inner_join(metric_mat, metric_90_mat, by = "var")
+  metric_mat[,-1] = round(metric_mat[,-1], d)
+
+  at_26 = round(c(m_10_preds_data[m_10_preds_data$lat == 26,"preds"],  m_50_preds_data[m_50_preds_data$lat == 26,"preds"], m_90_preds_data[m_90_preds_data$lat == 26,"preds"]),d)
+  at_26_CI_low = round(c(m_10_preds_data[m_10_preds_data$lat == 26,"conf.low"],  m_50_preds_data[m_50_preds_data$lat == 26,"conf.low"], m_90_preds_data[m_90_preds_data$lat == 26,"conf.low"]),d)
+  at_26_CI_high = round(c(m_10_preds_data[m_10_preds_data$lat == 26,"conf.high"],  m_50_preds_data[m_50_preds_data$lat == 26,"conf.high"], m_90_preds_data[m_90_preds_data$lat == 26,"conf.high"]), d)
+  at_26_pm = at_26 - at_26_CI_low
+  at_48 = round(c(m_10_preds_data[m_10_preds_data$lat == 48,"preds"], m_50_preds_data[m_50_preds_data$lat == 48,"preds"], m_90_preds_data[m_90_preds_data$lat == 48,"preds"]), d)
+  at_48_CI_low = round(c(m_10_preds_data[m_10_preds_data$lat == 48,"conf.low"], m_50_preds_data[m_50_preds_data$lat == 48,"conf.low"], m_90_preds_data[m_90_preds_data$lat == 48,"conf.low"]), d)
+  at_48_CI_high = round(c(m_10_preds_data[m_10_preds_data$lat == 48,"conf.high"], m_50_preds_data[m_50_preds_data$lat == 48,"conf.high"], m_90_preds_data[m_90_preds_data$lat == 48,"conf.high"]), d)
+  at_48_pm = at_48 - at_48_CI_low
+  
+  dif_48_26 = round(at_48 - at_26, d)
+  effect_mat = data.frame(quant = c("10%", "50%", "90%"), at_26, at_26_CI_low, at_26_CI_high, at_48, at_48_CI_low, at_48_CI_high, dif_48_26)
+  effect_mat[,-1] = round(effect_mat[,-1],d)
+  rownames(effect_mat) = c(paste(metric_name, "_q10", sep = ""),
+                           paste(metric_name, "_q50", sep = ""),
+                           paste(metric_name, "_q90", sep = ""))
+  
+effect_mat_char = data.frame(var = rep(metric_name, 3),
+  quant = paste(season, c("10%", "50%", "90%"), "passage"),
+                             at_26N = paste(at_26, " (", at_26_CI_low, ", ", at_26_CI_high, ")", sep = ""),
+                             at_48N = paste(at_48, " (", at_48_CI_low, ", ", at_48_CI_high, ")", sep = ""),
+                             dif = dif_48_26,
+  at_26N_pm = paste(at_26, " +-", round(at_26_pm,d), sep = ""),
+                             at_48N_pm = paste(at_48, " +-", round(at_48_pm,d), sep = ""),
+  dif_char = c(results_10$pred_dif_char, results_50$pred_dif_char, results_90$pred_dif_char),
+  dif_plus_minus = c(results_10$pred_pm_char, results_50$pred_pm_char, results_90$pred_pm_char),
+  lat_terms = c(results_10$lat_chosen, results_50$lat_chosen, results_90$lat_chosen),
+  lon_terms = c(results_10$lon_chosen, results_50$lon_chosen, results_90$lon_chosen), lat_lon_term = c(results_10$latlon_chosen, results_50$latlon_chosen, results_90$latlon_chosen))
+
+effect_mat_char_lon = data.frame(var = rep(metric_name, 3),
+  quant = paste(season, c("10%", "50%", "90%"), "passage"),
+  lon_chosen = rbind(results_10$lon_chosen, results_50$lon_chosen, results_90$lon_chosen),
+  rbind(results_10$lon_pred_mat, results_50$lon_pred_mat, results_90$lon_pred_mat))
+
+#make plot for each longitude
+
+list_10 = results_10$lon_plot_data
+preds_10_data = list_10[[1]]
+preds_10_data$quant = "10%"
+preds_10_data_100 = list_10$m_preds
+poly_10_100 = list_10[[3]]
+preds_10_data_95.5 = list_10[[4]]
+poly_10_95.5 = list_10[[5]]
+preds_10_data_91 = list_10[[6]]
+poly_10_91 = list_10[[7]]
+
+ #return(list(m_chosen, m_preds, m_preds_data, m_poly, lat_chosen, lon_chosen, p_mat, p_vect, p_lat, p_all, lon_plot_data, pred_dif_char, pred_pm_char, latlon_chosen, AIC_vect, lon_pred_mat))
+
+list_50 = results_50$lon_plot_data
+preds_50_data = list_50[[1]]
+preds_50_data$quant = "50%"
+preds_50_data_100 = list_50$m_preds
+poly_50_100 = list_50[[3]]
+preds_50_data_95.5 = list_50[[4]]
+poly_50_95.5 = list_50[[5]]
+preds_50_data_91 = list_50[[6]]
+poly_50_91 = list_50[[7]]
+
+list_90 = results_90$lon_plot_data
+preds_90_data = list_90[[1]]
+preds_90_data$quant = "90%"
+preds_90_data_100 = list_90$m_preds
+poly_90_100 = list_90[[3]]
+preds_90_data_95.5 = list_90[[4]]
+poly_90_95.5 = list_90[[5]]
+preds_90_data_91 = list_90[[6]]
+poly_90_91 = list_90[[7]]
+
+  col_10 = "#CC79A7"
+  col_50 = "#0072B2"
+  col_90 = "#E69F00"
+    
+  
+preds_all = rbind(preds_10_data, preds_50_data, preds_90_data)
+preds_all_100 = preds_all %>% filter(lon == -100)
+preds_all_95.5 = preds_all %>% filter(lon == -95.5)
+preds_all_91 = preds_all %>% filter(lon == -91)
+
+poly_50_100$x = rev(poly_50_100$x)
+poly_50_100$y = rev(poly_50_100$y)
+
+plot_100 = ggplot(data = preds_all_100, aes(x = lat, y = preds, group = lon))+
+  geom_line(aes(col = quant, group = quant, linetype = quant))+
+  geom_point(aes(x = lat, y = metric, group = NA, colour = quant), data = site_means_all)+
+  geom_polygon(data = poly_10_100, aes(x=x, y=y, group = NA), fill = col_10, colour = NA, alpha = 0.3)+
+  geom_polygon(data = poly_50_100, aes(x=x, y=y, group = NA), fill = col_50, colour = NA, alpha = 0.3)+
+  geom_polygon(data = poly_90_100, aes(x=x, y=y, group = NA), fill = col_90, colour = NA, alpha = 0.3)+
+  scale_color_manual(values = c("10%" = col_10, "50%" = col_50, "90%" = col_90))+
+  ylab(ylab)+
+  xlab("Latitude")+
+  theme_classic()+
+  scale_linetype_manual(values = c("10%" = "solid", "50%" = "longdash", "90%" = "dotdash"), name = "Passage quantile")+
+  theme(legend.position = "none")+
+  ggtitle("100°W")
+
+plot_95.5 = ggplot(data = preds_all_95.5, aes(x = lat, y = preds, group = lon))+
+  geom_line(aes(col = quant, group = quant, linetype = quant))+
+  geom_point(aes(x = lat, y = metric, group = NA, colour = quant), data = site_means_all)+
+  geom_polygon(data = poly_10_95.5, aes(x=x, y=y, group = NA), fill = col_10, colour = NA, alpha = 0.3)+
+  geom_polygon(data = poly_50_95.5, aes(x=x, y=y, group = NA), fill = col_50, colour = NA, alpha = 0.3)+
+  geom_polygon(data = poly_90_95.5, aes(x=x, y=y, group = NA), fill = col_90, colour = NA, alpha = 0.3)+
+  scale_color_manual(values = c("10%" = col_10, "50%" = col_50, "90%" = col_90))+
+  ylab("")+
+  xlab("Latitude")+
+  theme_classic()+
+  scale_linetype_manual(values = c("10%" = "solid", "50%" = "longdash", "90%" = "dotdash"), name = "Passage quantile")+
+  theme(legend.position = "none")+
+  ggtitle("95.5°W")
+
+plot_91 = ggplot(data = preds_all_91, aes(x = lat, y = preds, group = lon))+
+  geom_line(aes(col = quant, group = quant, linetype = quant))+
+  geom_point(aes(x = lat, y = metric, group = NA, colour = quant), data = site_means_all)+
+  geom_polygon(data = poly_10_91, aes(x=x, y=y, group = NA), fill = col_10, colour = NA, alpha = 0.3)+
+  geom_polygon(data = poly_50_91, aes(x=x, y=y, group = NA), fill = col_50, colour = NA, alpha = 0.3)+
+  geom_polygon(data = poly_90_91, aes(x=x, y=y, group = NA), fill = col_90, colour = NA, alpha = 0.3)+
+  scale_color_manual(values = c("10%" = col_10, "50%" = col_50, "90%" = col_90))+
+  ylab("")+
+  xlab("Latitude")+
+  theme_classic()+
+  scale_linetype_manual(values = c("10%" = "solid", "50%" = "longdash", "90%" = "dotdash"), name = "Passage quantile")+
+  theme(legend.position = "none")+
+  ggtitle("91°W")
+
+lon_plots = list(plot_100, plot_95.5, plot_91)
+g = grid.arrange(grobs = list(plot_100, plot_95.5, plot_91), ncol = 3)
+plot(g)
+  
+return(list(plot_all, metric_mat, effect_mat, effect_mat_char, effect_mat_char_lon, lon_plots, res_plots, moransI_p, moransI_test_stat))
+}
+```
+
+##Run models (Figure 1)
+###Spring
+```{r track migration passage date across latide}
+spring_migration_track_plot = track_plot_lon("spring_q10", "spring_q50", "spring_q90", "Spring passage dates", "passage dates", "Spring passage dates", "spring", "", include_x_label = FALSE, include_y_label = TRUE, start_at_0 = FALSE, legend = FALSE)
+spring_migration_track_plot[[1]]+ scale_y_continuous(breaks = c(91, 105, 121, 135), labels = c("Apr 1", "Apr 15", "May 1", "May 15"))
+spring_migration_track_plot[[2]]
+spring_migration_track_plot[[3]] 
+spring_migration_track_mat =  spring_migration_track_plot[[4]]
+spring_migration_track_mat_lon = spring_migration_track_plot[[5]]
+spring_migration_res_plots = spring_migration_track_plot[[7]]
+spring_migration_moransI_p = spring_migration_track_plot[[8]]
+spring_migration_moransI_test = spring_migration_track_plot[[9]]
+spring_migration_moran_mat = data.frame("metric" = rep("spring_migration", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(spring_migration_moransI_test, 5),
+                                        "p" = round(spring_migration_moransI_p, 3))
+```
+
+```{r track EVI across latitude}
+spring_EVI_track_plot = track_plot_lon("spring_q10_EVI", "spring_q50_EVI", "spring_q90_EVI", "EVI", "EVI", "EVI", "spring", "c)", include_x_label = FALSE, include_y_label = TRUE, start_at_0 = TRUE, legend = FALSE)
+spring_EVI_track_plot[[1]]
+spring_EVI_track_plot[[2]]
+spring_EVI_track_plot[[3]]
+spring_EVI_track_mat = spring_EVI_track_plot[[4]]
+spring_EVI_track_mat_lon = spring_EVI_track_plot[[5]]
+spring_EVI_res_plots = spring_EVI_track_plot[[7]]
+spring_EVI_moransI_p = spring_EVI_track_plot[[8]]
+spring_EVI_moransI_test = spring_EVI_track_plot[[9]]
+spring_EVI_moran_mat = data.frame("metric" = rep("spring_EVI", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(spring_EVI_moransI_test, 5),
+                                        "p" = round(spring_EVI_moransI_p, 3))
+```
+
+```{r track mean temperature across latitude}
+spring_temp_track_plot = track_plot_lon("spring_q10_temp", "spring_q50_temp", "spring_q90_temp", "Mean temperature (°C)", "mean temperature", "Mean temperature (°C)", "spring","a)", FALSE, include_y_label = TRUE, start_at_0 = TRUE, legend = FALSE)
+spring_temp_track_plot[[1]]
+spring_temp_track_plot[[2]]
+spring_temp_track_plot[[3]]
+spring_temp_track_mat = spring_temp_track_plot[[4]]
+spring_temp_track_mat_lon = spring_temp_track_plot[[5]]
+spring_temp_res_plots = spring_temp_track_plot[[7]]
+spring_temp_moransI_p = spring_temp_track_plot[[8]]
+spring_temp_moransI_test = spring_temp_track_plot[[9]]
+spring_temp_moran_mat = data.frame("metric" = rep("spring_temp", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(spring_temp_moransI_test, 5),
+                                        "p" = round(spring_temp_moransI_p, 3))
+```
+
+```{r track min temperature across latitude}
+spring_min_temp_track_plot = track_plot_lon("spring_q10_min_temp", "spring_q50_min_temp", "spring_q90_min_temp", "Min. temperature (°C)", "Min. temperature", "Min. temperature (°C)", "spring", "b)", include_x_label = FALSE, include_y_label = TRUE, start_at_0 = TRUE, legend = FALSE)
+spring_min_temp_track_plot[[1]]
+spring_min_temp_track_plot[[2]]
+spring_min_temp_track_plot[[3]]
+spring_min_temp_track_mat = spring_min_temp_track_plot[[4]]
+spring_min_temp_track_mat_lon = spring_min_temp_track_plot[[5]]
+spring_min_temp_res_plots = spring_min_temp_track_plot[[7]]
+spring_min_temp_moransI_p = spring_min_temp_track_plot[[8]]
+spring_min_temp_moransI_test = spring_min_temp_track_plot[[9]]
+spring_min_temp_moran_mat = data.frame("metric" = rep("spring_min_temp", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(spring_min_temp_moransI_test, 5),
+                                        "p" = round(spring_min_temp_moransI_p, 3))
+```
+
+```{r track rain in previous 2 weeks across latitude}
+spring_rain_14_track_plot = track_plot_lon("spring_q10_rain_14", "spring_q50_rain_14", "spring_q90_rain_14", "Mean rainfall", "mean rainfall", expression(paste("Mean Rainfall (kg/", {m^2}, ")", sep = "")), "spring", "d)", TRUE, include_y_label = TRUE, start_at_0 = TRUE, legend = FALSE)
+spring_rain_14_track_plot[[1]]
+spring_rain_14_track_plot[[2]]
+spring_rain_14_track_plot[[3]]
+spring_rain_14_track_mat = spring_rain_14_track_plot[[4]]
+spring_rain_14_track_mat_lon = spring_rain_14_track_plot[[5]]
+spring_rain_14_res_plots = spring_rain_14_track_plot[[7]]
+spring_rain_14_moransI_p = spring_rain_14_track_plot[[8]]
+spring_rain_14_moransI_test = spring_rain_14_track_plot[[9]]
+spring_rain_14_moran_mat = data.frame("metric" = rep("spring_rain_14", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(spring_rain_14_moransI_test, 5),
+                                        "p" = round(spring_rain_14_moransI_p, 3))
+```
+
+```{r greenup}
+greenup_track_plot = track_plot_lon("spring_q10_ds_greenup", "spring_q50_ds_greenup", "spring_q90_ds_greenup", "Passage date \n minus greenup date", "passage date minus green-up date", "Passage date \n minus greenup date", "spring", "a)", TRUE, include_y_label = FALSE, start_at_0 = TRUE, legend = FALSE)
+greenup_track_plot[[1]]+ geom_hline(yintercept = 0)
+greenup_track_plot[[2]]
+greenup_track_plot[[3]] 
+greenup_track_plot_mat = greenup_track_plot[[4]]
+greenup_track_plot_mat_lon = greenup_track_plot[[5]]
+greenup_track_plot_mat = greenup_track_plot[[4]]
+greenup_track_plot_mat_lon = greenup_track_plot[[5]]
+greenup_res_plots = greenup_track_plot[[7]]
+greenup_moransI_p = greenup_track_plot[[8]]
+greenup_moransI_test = greenup_track_plot[[9]]
+greenup_moran_mat = data.frame("metric" = rep("greenup", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(greenup_moransI_test, 5),
+                                        "p" = round(greenup_moransI_p, 3))
+```
+
+```{r midgreenup}
+midgreenup_track_plot = track_plot_lon("spring_q10_ds_midgreenup", "spring_q50_ds_midgreenup", "spring_q90_ds_midgreenup", "Passage date \n minus midgreenup date", "passage date minus midgreenup date", "Passage date \n minus midgreenup date", "spring", "a)", TRUE, include_y_label = TRUE, start_at_0 = FALSE, legend = FALSE)
+midgreenup_track_plot[[1]]+ geom_hline(yintercept = 0)
+midgreenup_track_plot[[2]]
+midgreenup_track_plot[[3]] 
+midgreenup_track_plot_mat = midgreenup_track_plot[[4]]
+midgreenup_track_plot_mat_lon = midgreenup_track_plot[[5]]
+midgreenup_res_plots = midgreenup_track_plot[[7]]
+midgreenup_moransI_p = midgreenup_track_plot[[8]]
+midgreenup_moransI_test = midgreenup_track_plot[[9]]
+midgreenup_moran_mat = data.frame("metric" = rep("midgreenup", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(midgreenup_moransI_test, 5),
+                                        "p" = round(midgreenup_moransI_p, 3))
+```
+
+```{r maturity}
+maturity_track_plot = track_plot_lon("spring_q10_ds_maturity", "spring_q50_ds_maturity", "spring_q90_ds_maturity", "passage date minus maturity date",  "Passage date minus maturity date", "Passage date \n minus maturity date", "spring", "a)", TRUE, include_y_label = TRUE, start_at_0 = FALSE, legend = FALSE)
+maturity_track_plot[[1]]+ geom_hline(yintercept = 0)
+maturity_track_plot[[2]]
+maturity_track_plot[[3]] 
+maturity_track_plot_mat = maturity_track_plot[[4]]
+maturity_track_plot_mat_lon = maturity_track_plot[[5]]
+maturity_res_plots = maturity_track_plot[[7]]
+maturity_moransI_p = maturity_track_plot[[8]]
+maturity_moransI_test = maturity_track_plot[[9]]
+maturity_moran_mat = data.frame("metric" = rep("maturity", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(maturity_moransI_test, 5),
+                                        "p" = round(maturity_moransI_p, 3))
+```
+
+###Fall
+```{r track migration passage date across latide}
+fall_migration_track_plot = track_plot_lon("fall_q10", "fall_q50", "fall_q90", "Fall passage dates", "passage dates", "Fall passage dates", "fall", "", include_x_label = FALSE,include_y_label = FALSE, start_at_0 = FALSE, legend = FALSE)
+fall_migration_track_plot[[1]] + scale_y_continuous(breaks = c(227, 244, 258, 274, 288, 305), labels = c("Aug 15", "Sep 1", "Sep 15", "Oct 1", "Oct 15", "Nov 1"))
+fall_migration_track_plot[[2]]
+fall_migration_track_plot[[3]] 
+fall_migration_track_mat =  fall_migration_track_plot[[4]]
+fall_migration_track_mat_lon =  fall_migration_track_plot[[5]]
+fall_migration_res_plots = fall_migration_track_plot[[7]]
+fall_migration_moransI_p = fall_migration_track_plot[[8]]
+fall_migration_moransI_test = fall_migration_track_plot[[9]]
+fall_migration_moran_mat = data.frame("metric" = rep("fall_migration", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(fall_migration_moransI_test, 5),
+                                        "p" = round(fall_migration_moransI_p, 3))
+```
+
+
+```{r track EVI across latitude}
+fall_EVI_track_plot = track_plot_lon("fall_q10_EVI", "fall_q50_EVI", "fall_q90_EVI", "EVI", "EVI", "EVI", "fall", "g)", FALSE,include_y_label = FALSE, start_at_0 = TRUE, legend = FALSE)
+fall_EVI_track_plot[[1]]
+fall_EVI_track_plot[[2]]
+fall_EVI_track_plot[[3]]
+fall_EVI_track_mat = fall_EVI_track_plot[[4]]
+fall_EVI_track_mat_lon = fall_EVI_track_plot[[5]]
+fall_EVI_res_plots = fall_EVI_track_plot[[7]]
+fall_EVI_moransI_p = fall_EVI_track_plot[[8]]
+fall_EVI_moransI_test = fall_EVI_track_plot[[9]]
+fall_EVI_moran_mat = data.frame("metric" = rep("fall_EVI", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(fall_EVI_moransI_test, 5),
+                                        "p" = round(fall_EVI_moransI_p, 3))
+```
+
+```{r track fall mean temp across latitude}
+fall_temp_track_plot = track_plot_lon("fall_q10_temp", "fall_q50_temp", "fall_q90_temp", "Mean temperature (°C)", "mean temperature", "Mean temperature (°C)", "fall", "e)", FALSE,include_y_label = FALSE, start_at_0 = TRUE, legend = FALSE)
+fall_temp_track_plot[[1]]
+fall_temp_track_plot[[2]]
+fall_temp_track_plot[[3]]
+fall_temp_track_mat = fall_temp_track_plot[[4]]
+fall_temp_track_mat_lon = fall_temp_track_plot[[5]]
+fall_temp_res_plots = fall_temp_track_plot[[7]]
+fall_temp_moransI = fall_temp_track_plot[[8]]
+fall_temp_moransI_p = fall_temp_track_plot[[8]]
+fall_temp_moransI_test = fall_temp_track_plot[[9]]
+fall_temp_moran_mat = data.frame("metric" = rep("fall_temp", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(fall_temp_moransI_test, 5),
+                                        "p" = round(fall_temp_moransI_p, 3))
+```
+
+```{r track fall min  temp across latitude}
+fall_min_temp_track_plot = track_plot_lon("fall_q10_min_temp", "fall_q50_min_temp", "fall_q90_min_temp", "min. temperature", "Min. temperature (°C)", "Min. temperature (°C)", "fall", "f)", FALSE,include_y_label = FALSE, start_at_0 = TRUE, legend = FALSE)
+fall_min_temp_track_plot[[1]]
+fall_min_temp_track_plot[[2]]
+fall_min_temp_track_plot[[3]]
+fall_min_temp_track_mat = fall_min_temp_track_plot[[4]]
+fall_min_temp_track_mat_lon = fall_min_temp_track_plot[[5]]
+fall_min_temp_res_plots = fall_min_temp_track_plot[[7]]
+fall_min_temp_moransI_p = fall_min_temp_track_plot[[8]]
+fall_min_temp_moransI_test = fall_min_temp_track_plot[[9]]
+fall_min_temp_moran_mat = data.frame("metric" = rep("fall_min_temp", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(fall_min_temp_moransI_test, 5),
+                                        "p" = round(fall_min_temp_moransI_p, 3))
+```
+
+```{r track rain in previous 2 weeks across latitude}
+fall_rain_14_track_plot = track_plot_lon("fall_q10_rain_14", "fall_q50_rain_14", "fall_q90_rain_14", "Mean rainfall (kg/m2)", "mean rainfall", expression(paste("Mean Rainfall (kg/", {m^2}, ")", sep = "")), "fall", "h)", TRUE, include_y_label = FALSE, start_at_0 = TRUE, legend = FALSE)
+fall_rain_14_track_plot[[1]]
+fall_rain_14_track_plot[[2]]
+fall_rain_14_track_plot[[3]]
+fall_rain_14_track_mat = fall_rain_14_track_plot[[4]]
+fall_rain_14_track_mat_lon = fall_rain_14_track_plot[[5]]
+fall_rain_14_temp_res_plots = fall_rain_14_track_plot[[7]]
+fall_rain_14_moransI_p = fall_rain_14_track_plot[[8]]
+fall_rain_14_moransI_test = fall_rain_14_track_plot[[9]]
+fall_rain_14_moran_mat = data.frame("metric" = rep("fall_rain_14", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(fall_rain_14_moransI_test, 5),
+                                        "p" = round(fall_rain_14_moransI_p, 3))
+```
+
+```{r senescence}
+senescence_track_plot = track_plot_lon("fall_q10_ds_senescence","fall_q50_ds_senescence", "fall_q90_ds_senescence", "Passage date \n minus senescence date", "passage date minus senescence date", "Passage date \n minus senescence date", "fall", "a)", TRUE, include_y_label = TRUE, start_at_0 = FALSE, legend = FALSE)
+senescence_track_plot[[1]]+ geom_hline(yintercept = 0)
+senescence_track_plot[[2]]
+senescence_track_plot[[3]] 
+senescence_track_plot_mat = senescence_track_plot[[4]]
+senescence_track_plot_mat_lon = senescence_track_plot[[5]]
+senescence_res_plots = senescence_track_plot[[7]]
+senescence_moransI_p = senescence_track_plot[[8]]
+senescence_moransI_test = senescence_track_plot[[9]]
+senescence_moran_mat = data.frame("metric" = rep("senescence", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(senescence_moransI_test, 5),
+                                        "p" = round(senescence_moransI_p, 3))
+```
+
+```{r midgreendown}
+midgreendown_track_plot = track_plot_lon("fall_q10_ds_midgreendown", "fall_q50_ds_midgreendown", "fall_q90_ds_midgreendown", "Passage date \n minus midgreendown date", "passage date minus midgreendown date", "Passage date \n minus midgreendown date", "fall", "a)", TRUE, include_y_label = TRUE, start_at_0 = FALSE, legend = FALSE)
+midgreendown_track_plot[[1]]+ geom_hline(yintercept = 0)
+midgreendown_track_plot[[2]]
+midgreendown_track_plot[[3]] 
+midgreendown_track_plot_mat = midgreendown_track_plot[[4]]
+midgreendown_track_plot_mat_lon = midgreendown_track_plot[[5]]
+midgreendown_res_plots = midgreendown_track_plot[[7]]
+midgreendown_moransI_p = midgreendown_track_plot[[8]]
+midgreendown_moransI_test = midgreendown_track_plot[[9]]
+midgreendown_moran_mat = data.frame("metric" = rep("midgreendown", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(midgreendown_moransI_test, 5),
+                                        "p" = round(midgreendown_moransI_p, 3))
+```
+
+```{r dormancy}
+dormancy_track_plot = track_plot_lon("fall_q10_ds_dormancy", "fall_q50_ds_dormancy", "fall_q90_ds_dormancy", "Passage date \n minus dormancy date", "passage date minus dormancy date", "Passage date \n minus dormancy date", "fall", "a)", TRUE, include_y_label = TRUE, start_at_0 = FALSE, legend = FALSE)
+dormancy_track_plot[[1]]+ geom_hline(yintercept = 0)
+dormancy_track_plot[[2]]
+dormancy_track_plot[[3]] 
+dormancy_track_plot_mat = dormancy_track_plot[[4]]
+dormancy_track_plot_mat_lon = dormancy_track_plot[[5]]
+dormancy_res_plots = dormancy_track_plot[[7]]
+dormancy_moransI_p = dormancy_track_plot[[8]]
+dormancy_moransI_test = dormancy_track_plot[[9]]
+dormancy_moran_mat = data.frame("metric" = rep("dormancy", 3), 
+                                        "quantile" = c("10%", "50%", "90%"),
+                                        "test_stat" = round(dormancy_moransI_test, 5),
+                                        "p" = round(dormancy_moransI_p, 3))
+```
+
+#Make Table S7 (Moran's I stats)
+```{r make moran mat}
+spring_moran_mat = rbind(spring_temp_moran_mat, spring_min_temp_moran_mat, spring_EVI_moran_mat, spring_rain_14_moran_mat, greenup_moran_mat, maturity_moran_mat)
+
+fall_moran_mat = rbind(fall_temp_moran_mat, fall_min_temp_moran_mat, fall_EVI_moran_mat, fall_rain_14_moran_mat, senescence_moran_mat, dormancy_moran_mat)
+
+write.csv(spring_moran_mat, "spring_moran_mat.csv")
+write.csv(fall_moran_mat, "fall_moran_mat.csv")
+```
+
+
+##Make Figure 1
+
+```{r make figure combining all three}
+plot_list = list(spring_temp_track_plot[[1]] + ylim(0, 35),  fall_temp_track_plot[[1]] + ylim(0 ,35), spring_min_temp_track_plot[[1]] + ylim(0, 30), fall_min_temp_track_plot[[1]] + ylim(0, 30), spring_EVI_track_plot[[1]] + ylim(0, 0.6), fall_EVI_track_plot[[1]] + ylim(0, 0.6), spring_rain_14_track_plot[[1]] + ylim(0, 0.25), fall_rain_14_track_plot[[1]] + ylim(0, 0.25))
+
+grobs = make_grobs(plot_list)
+
+grid.arrange(grobs = grobs, ncol = 2, widths = unit(c(87,86), "mm"))
+
+folder = "JAE_figures/"
+tiff(file = paste(folder, "Fig1_raw.tiff", sep = ""), width = 180, height = 200, units = "mm", res = 1000)
+grid.arrange(grobs = grobs, ncol = 2, widths = unit(c(87,86), "mm"))
+dev.off()
+```
+
+##Make residual plots figures
+```{r combine residual plots}
+h = 70
+folder = "Residual_plots/ER_9/"
+
+tiff(file = paste(folder, "spring_q10_greenup.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(greenup_res_plots[[1]])
+dev.off()
+
+tiff(file = paste(folder, "spring_q50_greenup.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(greenup_res_plots[[2]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "spring_q90_greenup.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(greenup_res_plots[[3]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "spring_q10_maturity.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(maturity_res_plots[[1]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "spring_q50_maturity.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(maturity_res_plots[[2]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "spring_q90_maturity.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(maturity_res_plots[[3]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "fall_q10_senescence.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(senescence_res_plots[[1]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "fall_q50_senescence.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(senescence_res_plots[[2]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "fall_q90_senescence.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(senescence_res_plots[[3]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "fall_q10_dormancy.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(dormancy_res_plots[[1]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "fall_q50_dormancy.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(dormancy_res_plots[[2]], bg = "white")
+dev.off()
+
+tiff(file = paste(folder, "fall_q90_dormancy.tiff", sep = ""), width = 173, height = h, units = "mm", res = 300)
+plot(dormancy_res_plots[[3]], bg = "white")
+dev.off()
+```
+
+
+##Save model outputs (Tables S1 - S4)
+```{r save results from mean longitude}
+spring_mat = rbind(spring_temp_track_mat, spring_min_temp_track_mat, spring_EVI_track_mat, spring_rain_14_track_mat, greenup_track_plot_mat, maturity_track_plot_mat)
+fall_mat = rbind(fall_temp_track_mat, fall_min_temp_track_mat, fall_EVI_track_mat, fall_rain_14_track_mat, senescence_track_plot_mat, dormancy_track_plot_mat)
+
+spring_print = spring_mat %>% dplyr::select(c(var, quant, at_26N_pm, at_48N_pm, dif_plus_minus, lat_terms, lon_terms, lat_lon_term))
+spring_print$var = str_replace(spring_print$var, "°C", "C")
+spring_print$var = str_replace(spring_print$var, "Passage date \n minus", "Days since")
+spring_print$quant = str_replace(spring_print$quant, "spring ", "")
+spring_print$quant = str_replace(spring_print$quant, " passage", "")
+minus_signs = apply(spring_print, MARGIN = 2, FUN = function(x){str_starts(x, "-")})
+spring_print[minus_signs] = paste("'", spring_print[minus_signs], sep = "")
+write.csv(spring_print, "Table_S1_spring.csv")
+
+fall_print = fall_mat %>% dplyr::select(c(var, quant, at_26N_pm, at_48N_pm, dif_plus_minus, lat_terms, lon_terms, lat_lon_term))
+fall_print$var = str_replace(fall_print$var, "°C", "C")
+fall_print$var = str_replace(fall_print$var, "Passage date \n minus", "Days since")
+fall_print$quant = str_replace(fall_print$quant, "fall ", "")
+fall_print$quant = str_replace(fall_print$quant, " passage", "")
+minus_signs = apply(fall_print, MARGIN = 2, FUN = function(x){str_starts(x, "-")})
+fall_print[minus_signs] = paste("'", fall_print[minus_signs], sep = "")
+write.csv(fall_print, "Table_S1_fall.csv")
+```
+
+```{r save Moran's I tests}
+MI_mat = rbind(spring_temp_moransI,
+      spring_min_temp_moransI,
+      spring_EVI_moransI,
+      spring_rain_14_moransI,
+      greenup_moransI,
+      maturity_moransI,
+      fall_temp_moransI,
+      fall_min_temp_moransI,
+      fall_EVI_moransI,
+      fall_rain_14_moransI,
+      senescence_moransI,
+      dormancy_moransI
+)
+      
+rownames(MI_mat) = str_replace(rownames(MI_mat), "_moransI", "")
+write.csv(MI_mat, "MoransI.csv")
+```
+
+```{r save results from all longitudes}
+
+spring_ind = which(spring_print$lat_lon_term != FALSE)
+
+spring_mat = rbind(spring_temp_track_mat_lon, spring_min_temp_track_mat_lon, spring_EVI_track_mat_lon, spring_rain_14_track_mat_lon, greenup_track_plot_mat_lon, maturity_track_plot_mat_lon)
+fall_mat = rbind(fall_temp_track_mat_lon, fall_min_temp_track_mat_lon, fall_EVI_track_mat_lon, fall_rain_14_track_mat_lon, senescence_track_plot_mat_lon, dormancy_track_plot_mat_lon)
+
+spring_mat = spring_mat %>% filter(interaction.present != FALSE)
+fall_mat = fall_mat %>% filter(interaction.present != FALSE)
+
+spring_print = spring_mat %>% dplyr::select(c(var, quant, X100.W, X95.5.W, X91.W))
+spring_print$var = str_replace(spring_print$var, "°C", "C")
+spring_print$var = str_replace(spring_print$var, "Passage date \n minus", "Days since")
+spring_print$quant = str_replace(spring_print$quant, "spring ", "")
+spring_print$quant = str_replace(spring_print$quant, " passage", "")
+minus_signs = apply(spring_print, MARGIN = 2, FUN = function(x){str_starts(x, "-")})
+spring_print[minus_signs] = paste("'", spring_print[minus_signs], sep = "")
+#write.csv(spring_print, "Table_S3_spring.csv")
+
+fall_print = fall_mat %>% dplyr::select(c(var, quant, X100.W, X95.5.W, X91.W))
+fall_print$var = str_replace(fall_print$var, "°C", "C")
+fall_print$var = str_replace(fall_print$var, "Passage date \n minus", "Days since")
+fall_print$quant = str_replace(fall_print$quant, "fall ", "")
+fall_print$quant = str_replace(fall_print$quant, " passage", "")
+minus_signs = apply(fall_print, MARGIN = 2, FUN = function(x){str_starts(x, "-")})
+fall_print[minus_signs] = paste("'", fall_print[minus_signs], sep = "")
+#write.csv(fall_print, "Table_S4_fall.csv")
+```
+
+##Plot cases where lat/lon interaction matters (Figure S1-S2)
+```{r plot lat lon interactions}
+remove_x = function(plot) {return(plot + xlab(" "))}
+remove_title = function(plot) {return(plot + ggtitle(" "))}
+reverse_x = function(plot) {return(plot + scale_x_reverse())}
+start_at_0 = function(plot) {return(plot + expand_limits(y=0))}
+
+spring_temp_list = lapply(spring_temp_track_plot[[6]], FUN = remove_x)
+spring_temp_list = lapply(spring_temp_list, FUN = function(x) {x + ylim(5,30)})
+spring_EVI_list = lapply(lapply(lapply(spring_EVI_track_plot[[6]], FUN = remove_x), start_at_0), remove_title)
+spring_EVI_list[[1]] = spring_EVI_list[[1]] + ylab("EVI \n ")
+spring_EVI_list = lapply(spring_EVI_list, FUN = function(x) {x + ylim(-0.2, 0.8)})
+spring_rain_14_list = lapply(lapply(spring_rain_14_track_plot[[6]], FUN = remove_x), start_at_0)
+spring_rain_14_list = lapply(spring_rain_14_list, FUN = remove_title)
+spring_rain_14_list = lapply(spring_rain_14_list, FUN = function(x) {x + ylim(-0.05, 0.23)})
+spring_maturity_list = lapply(maturity_track_plot[[6]], FUN = remove_title)
+spring_maturity_list = lapply(spring_maturity_list, FUN = function(x) {x + ylim(-225, 75)})
+
+spring_plot_list = append(spring_temp_list,append(append(spring_EVI_list, spring_rain_14_list), spring_maturity_list))
+
+grid.arrange(grobs = spring_plot_list, ncol = 3)
+
+fall_mean_temp_list = lapply(fall_temp_track_plot[[6]], remove_x)
+fall_mean_temp_list = lapply(fall_mean_temp_list, FUN = function(x) {x + ylim(7, 33)})
+fall_EVI_list = lapply(fall_EVI_track_plot[[6]], remove_x)
+fall_EVI_list = lapply(fall_EVI_list, remove_title)
+fall_EVI_list[[1]] = fall_EVI_list[[1]] + ylab("EVI \n ")
+fall_EVI_list = lapply(fall_EVI_list, FUN = function(x) {x + ylim(0.1, 0.7)})
+fall_rain_14_list = lapply(fall_rain_14_track_plot[[6]], FUN = remove_title)
+fall_rain_14_list = lapply(fall_rain_14_list, FUN = remove_x)
+fall_rain_14_list = lapply(fall_rain_14_list, FUN = function(x) {x + ylim(0, 0.4)})
+fall_senescence_list = lapply(senescence_track_plot[[6]], FUN = remove_title)
+fall_senescence_list = lapply(fall_senescence_list, FUN = function(x) {x + ylim(-40, 170)})
+
+fall_plot_list = append(append(append(fall_mean_temp_list, fall_EVI_list), fall_rain_14_list), fall_senescence_list)
+grid.arrange(grobs = fall_plot_list, ncol = 3)
+
+fall_grobs = make_grobs(fall_plot_list)
+spring_grobs = make_grobs(spring_plot_list)
+```
+
+```{r save figures S1 an S2}
+tiff(file = "FigS1.tiff", width = 66*3, height = 200, units = "mm", res = 300)
+grid.arrange(grobs = spring_grobs, ncol = 3, widths = unit(c(66,66,66), "mm"))
+dev.off()
+
+tiff(file = "FigS2.tiff", width = 66*3, height = 200, units = "mm", res = 300)
+grid.arrange(grobs = fall_grobs, ncol = 3, widths = unit(c(66,66,66), "mm"))
+dev.off()
+```
+
+
+#Plot multiple phenological events across latitudes (Fig 3)
+```{r plot dates of 2 phenological events and 3 passage quantiles}
+
+phen_1_data = "mean_greenup"
+  phen_2_data = "mean_maturity"
+  phen_1_name = "Green up"
+  phen_2_name = "Maturity"
+  season = "spring"
+  letter = "a) Spring"
+  
+
+plot_dates_2 = function(phen_1_data, phen_2_data, phen_1_name, phen_2_name, season, letter) {
+  if (season == "spring"){
+    pass_10_data = "spring_q10"
+    pass_50_data = "spring_q50"
+    pass_90_data = "spring_q90"
+  }
+  if (season == "fall"){
+    pass_10_data = "fall_q10"
+    pass_50_data = "fall_q50"
+    pass_90_data = "fall_q90"
+  }
+  
+  ylab = "Day of Year"
+  lat = data$lat
+  lon = data$lon
+  site = as.factor(data$site)
+  year = as.factor(data$year)
+
+  results_phen_1 = choose_model(phen_1_data, "phen 1")
+ m_phen_1 = results_phen_1$m_chosen
+ m_phen_1_preds = results_phen_1$m_preds
+ m_phen_1_preds_data = results_phen_1$m_preds_data
+ m_phen_1_poly = results_phen_1$m_poly
+ slopes = summary(m_phen_1)$coefficients
+ slope_phen_1_mat = make_slope_mat(slopes)
+ metric_phen_1_mat = data.frame(c("lat", "lat2", "lon", "lon2", "lat:lon"), slope_phen_1_mat$Est., slope_phen_1_mat$SE)
+ colnames(metric_phen_1_mat) = c("var", paste("slope_est", "_phen_1", sep = ""),  paste("slope_SE", "_phen_1", sep = ""))
+ 
+  results_phen_2 = choose_model(phen_2_data, "phen 2")
+ m_phen_2 = results_phen_2$m_chosen
+ m_phen_2_preds = results_phen_2$m_preds
+ m_phen_2_preds_data = results_phen_2$m_preds_data
+ m_phen_2_poly = results_phen_2$m_poly
+ slopes = summary(m_phen_2)$coefficients
+ slope_phen_2_mat = make_slope_mat(slopes)
+ metric_phen_2_mat = data.frame(c("lat", "lat2", "lon", "lon2", "lat:lon"), slope_phen_2_mat$Est., slope_phen_2_mat$SE)
+ colnames(metric_phen_2_mat) = c("var", paste("slope_est", "_phen_2", sep = ""),  paste("slope_SE", "_phen_2", sep = ""))
+ 
+results_10 = choose_model(pass_10_data, "pass 10")
+ m_10 = results_10$m_chosen
+ m_10_preds = results_10$m_preds
+ m_10_preds_data = results_10$m_preds_data
+ m_10_poly = results_10$m_poly
+ slopes = summary(m_10)$coefficients
+ slope_10_mat = make_slope_mat(slopes)
+ metric_10_mat = data.frame(c("lat", "lat2", "lon", "lon2", "lat:lon"), slope_10_mat$Est., slope_10_mat$SE)
+ colnames(metric_10_mat) = c("var", paste("slope_est", "_10", sep = ""),  paste("slope_SE", "_10", sep = ""))
+
+ results_50 = choose_model(pass_50_data, "pass 50")
+ m_50 = results_50$m_chosen
+ m_50_preds = results_50$m_preds
+ m_50_preds_data = results_50$m_preds_data
+ m_50_poly = results_50$m_poly
+ slopes = summary(m_50)$coefficients
+ slope_50_mat = make_slope_mat(slopes)
+ metric_50_mat = data.frame(c("lat", "lat2", "lon", "lon2", "lat:lon"), slope_50_mat$Est., slope_50_mat$SE)
+ colnames(metric_50_mat) = c("var", paste("slope_est", "_50", sep = ""),  paste("slope_SE", "_50", sep = ""))
+ 
+ results_90 = choose_model(pass_90_data, "pass 90")
+ m_90 = results_90$m_chosen
+ m_90_preds = results_90$m_preds
+ m_90_preds_data = results_90$m_preds_data
+ m_90_poly = results_90$m_poly
+ slopes = summary(m_90)$coefficients
+ slope_90_mat = make_slope_mat(slopes)
+ metric_90_mat = data.frame(c("lat", "lat2", "lon", "lon2", "lat:lon"), slope_90_mat$Est., slope_90_mat$SE)
+ colnames(metric_90_mat) = c("var", paste("slope_est", "_90", sep = ""),  paste("slope_SE", "_90", sep = ""))
+ 
+    col_phen_1 = "#009E73"
+  col_phen_2 = "#56B4E9"
+  col_10 = "#CC79A7"
+  col_50 = "#0072B2"
+  col_90 = "#E69F00"
+    
+  color_names = c("10% passage", "50% passage", "90% passage", phen_1_name, phen_2_name)
+  color_vect = c(col_10, col_50, col_90, col_phen_1, col_phen_2)
+  names(color_vect) = color_names
+  
+data_df = data.frame(data)
+  passage_10_data = data_df[,which(colnames(data) == pass_10_data)]
+  passage_50_data = data_df[,which(colnames(data) == pass_50_data)]
+  passage_90_data = data_df[,which(colnames(data) == pass_90_data)]
+  phenology_1_data = data_df[,which(colnames(data) == phen_1_data)]
+  phenology_2_data = data_df[,which(colnames(data) == phen_2_data)]
+  
+  
+  data3 = data.frame("site" = data$site, "lat" = data$lat, "lon" = data$lon, "pass_10_data" = as.vector(passage_10_data), "pass_50_data" = as.vector(passage_50_data), "pass_90_data" = as.vector(passage_90_data), "phen_1_data" = as.vector(phenology_1_data), "phen_2_data" = as.vector(phenology_2_data))
+  
+  site_means = data3 %>% group_by(site) %>% summarise(lat = mean(lat), lon = mean(lon),
+                                                 pass_10 = mean(pass_10_data, na.rm = TRUE),
+                                                 pass_50 = mean(pass_50_data, na.rm = TRUE),
+                                                 pass_90 = mean(pass_90_data, na.rm = TRUE),
+                                                 phen_1 = mean(phen_1_data, na.rm = TRUE),
+                                                 phen_2 = mean(phen_2_data, na.rm = TRUE)
+                                                 )
+
+
+site_means_10 = data.frame(site_means[,1:4], event  = "10% passage")
+site_means_50 = data.frame(site_means[,c(1:3,5)], event = "50% passage")
+site_means_90 = data.frame(site_means[,c(1:3,6)], event = "90% passage")
+site_means_phen_1 = data.frame(site_means[,c(1:3,7)], event = phen_1_name)
+site_means_phen_2 = data.frame(site_means[,c(1:3,8)], event = phen_2_name)
+colnames(site_means_10)[4] = colnames(site_means_50)[4] = colnames(site_means_90)[4] = colnames(site_means_phen_1)[4] = colnames(site_means_phen_2)[4] =  "metric"
+site_means_all = rbind(site_means_10, site_means_50, site_means_90, site_means_phen_1, site_means_phen_2)
+
+m_10_preds_data_2 = data.frame(m_10_preds_data, "event" = "10% passage")
+m_50_preds_data_2 = data.frame(m_50_preds_data, "event" = "50% passage")
+m_90_preds_data_2 = data.frame(m_90_preds_data, "event" = "90% passage")
+m_phen_1_preds_data_2 = data.frame(m_phen_1_preds_data, "event" = phen_1_name)
+m_phen_2_preds_data_2 = data.frame(m_phen_2_preds_data, "event" = phen_2_name)
+all_preds_data = rbind(m_10_preds_data_2, m_50_preds_data_2, m_90_preds_data_2, m_phen_1_preds_data_2, m_phen_2_preds_data_2)
+
+
+#if(season == "spring"){
+  data_ends = all_preds_data %>% filter(lat == 48)
+  data_ends$lat = c(24, 28, 32, 36, 40)
+  data_ends$preds = c(5, 10, 15, 20, 25)
+  #data_ends = all_preds_data %>% filter(lat == 50)
+  #data_ends[2,] = (all_preds_data %>% filter(lat == 40))[2,]
+  #data_ends[4:5,] = (all_preds_data %>% filter(lat == 26))[4:6,]} else {
+  #data_ends = all_preds_data %>% filter(lat == 24)
+  #data_ends[2,] = (all_preds_data %>% filter(lat == 32))[2,]
+  #data_ends[4:5,] = (all_preds_data %>% filter(lat == 48))[4:5,]}
+
+plot_all = ggplot(all_preds_data, group = "event")+
+  theme_classic()+
+  theme(text = element_text(size = 10))+
+  geom_point(aes(x = lat, y = metric, col = event), data = site_means_all, size = 1)+
+  geom_line(aes(x = lat, y = preds, col = event))+
+  geom_polygon(data = m_phen_1_poly, aes(x=x, y=y), fill = col_phen_1, colour = NA, alpha = 0.5)+
+  geom_polygon(data = m_phen_2_poly, aes(x=x, y=y), fill = col_phen_2, colour = NA, alpha = 0.5)+
+  geom_polygon(data = m_10_poly, aes(x=x, y=y), fill = col_10, colour = NA, alpha = 0.5)+
+  geom_polygon(data = m_50_poly, aes(x=x, y=y), fill = col_50, colour = NA, alpha = 0.5)+
+  geom_polygon(data = m_90_poly, aes(x=x, y=y), fill = col_90, colour = NA, alpha = 0.5)+
+  xlab("Latitude")+
+  ylab("")+
+  scale_color_manual(values = color_vect, name = "", guide = FALSE)+
+  #geom_label_repel(aes(label = event, col = event, x = lat, y = preds), direction = "y", data = data_ends, alpha = 0.9, size = 2.5)+
+  ggtitle(letter)+
+  theme(plot.title = element_text(size = 10))
+  
+  if(season == "fall") {plot_all = plot_all + scale_x_reverse()}
+  return(plot_all)
+}
+```
+
+```{r spring}
+spring_plot = plot_dates_2("mean_greenup", "mean_maturity", "Green up", "Maturity", "spring", "a) Spring")
+spring_plot = spring_plot + scale_y_continuous(breaks = c(-16, 15, 46, 74, 105, 135, 166, 196), labels = c("Dec 15", "Jan 15", "Feb 15", "Mar 15", "Apr 15", "May 15", "Jun 15", "Jul 15")) + theme(plot.margin = unit(c(2, 13, 2, 0), "mm")) + xlim(30, 48)
+spring_plot
+```
+
+```{r fall plot}
+fall_plot_1 = plot_dates_2("mean_senescence", "mean_dormancy", "Senescence", "Dormancy", "fall", "b) Fall")
+fall_plot = fall_plot_1 + scale_y_continuous(breaks = c(196, 227, 258, 288, 319, 349, 380), labels = c("Jul 15", "Aug 15", "Sep 15", "Oct 15", "Nov 15", "Dec 15", "Jan 15")) + theme(plot.margin = unit(c(2, 17, 2, 0), "mm")) + scale_x_reverse(limits = c(48,30))
+fall_plot
+```
+
+```{r combine plots}
+plot_list = list(spring_plot, fall_plot)
+grid.arrange(grobs = list(spring_plot, fall_plot), ncol = 2, widths = unit(c(80,80), "mm"))
+```
+
+```{r save Fig3 as tiff}
+tiff(file = paste(folder, "Fig3_raw.tiff", sep = ""), width = 180, height = 80, units = "mm", res = 1000)
+grid.arrange(grobs = list(spring_plot, fall_plot), ncol = 2, widths = unit(c(84,89), "mm"))
+dev.off()
+```
+#plot absolute value of greenup anomaly (Figure S4)
+
+```{r read in data}
+data = readRDS("data.Rda")
+mid_lat = 37
+min_lat = 26
+max_lat = 48
+site = data$site
+year = data$year
+lat = data$lat
+lon= data$lon
+
+site_means = data %>% group_by(site) %>% summarise(lat = mean(lat),
+                                                            spring_passage_10 = mean(spring_q10),
+                                                            spring_passage_50 = mean(spring_q50),
+                                                            spring_passage_90 = mean(spring_q90),
+                                                   fall_passage_10 = mean(fall_q10),
+                                                   fall_passage_50 = mean(fall_q50),
+                                                   fall_passage_90 = mean(fall_q90))
+
+```
+
+```{r function to chose models with a gamma error structure}
+data = data %>% mutate(abs_greenup_anomaly = abs(greenup_anomaly))
+metric = "abs_greenup_anomaly"
+
+options(na.action = na.fail)
+
+#rename the column with the variable you want to analyze, changing to "response"
+m_data = data
+colnames(m_data)[which(colnames(m_data) == metric)] = "response"
+
+#remove NA values
+m_data= m_data[!is.na(m_data$response),]
+
+#create a global model with all lat/lon terms
+m_global = glmer(response ~ (1|site) + (1|year) + lat + lon + I(lat^2) + I(lon^2) + lat*lon, data = m_data, family = Gamma(link = "log"))
+m_dredged = dredge(m_global, beta = "none", evaluate = TRUE, rank = "AICc", subset = expression ("lat" | "I(lat^2)"))
+#m_chosen = get.models(m_dredged, 1)[[1]]
+m_chosen = get.models(m_dredged, subset = delta < 2)
+if (length(m_chosen) == 1) {m_chosen = m_chosen[[1]]} else
+{
+  count_vars = function(x) {
+    str_count(as.character(formula(x))[3], "\\+") - 1
+  }
+  
+  var_nums = unlist(lapply(m_chosen, count_vars))
+  ind = which(var_nums == min(var_nums))[1]
+  m_chosen = m_chosen[[ind]]
+}
+
+m_preds = ggpredict(m_chosen, terms = c("lat [26:48]", "lon [-95.93]"))
+m_preds_data = data.frame("lat" = m_preds$x, "preds" = m_preds$predicted, "conf.low" = m_preds$conf.low, "conf.high" = m_preds$conf.high)
+m_poly = make_polygon_df(m_preds_data$lat, m_preds_data$conf.low, m_preds_data$conf.high)
+
+plot_all = ggplot(data, aes(x = lat, y = abs_greenup_anomaly))+
+  geom_point(col = col_phen_1, size = 0.6)+
+  theme_classic()+
+  geom_line(aes(x = lat, y = preds), data = m_preds_data, col = col_phen_1)+
+  geom_polygon(data = m_poly, aes(x=x, y=y), fill = col_phen_1, alpha = 0.5)+
+  xlab("Latitude")+
+  ylab("Absolute value of \n greenup date anomaly (days)")+
+  ggtitle("a)")+
+  theme(text = element_text(size = 10))
+  
+resids = predict(m_chosen) - m_data$response
+plot_resids = ggplot()+
+  theme_classic()+
+  geom_point(aes(x = m_data$lat, y = resids), col = col_90, size =0.6)+
+  xlab("Latitude")+
+  ylab("Residual error")+
+  ggtitle("b)")+
+  theme(text = element_text(size = 10))
+
+grid.arrange(grobs = list(plot_all, plot_resids), ncol = 2)
+```
+
+#Preciptiation  models 1,2,3, and 4 weeks prior to passage (Fig S3)
+```{r track rain in previous 1 week across latitude}
+spring_rain_7_track_plot = track_plot_lon("spring_q10_rain_7", "spring_q50_rain_7", "spring_q90_rain_7", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "a) 7 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+spring_rain_7_track_plot[[1]]
+spring_rain_7_track_plot[[2]]
+spring_rain_7_track_plot[[3]]
+spring_rain_7_track_mat = spring_rain_7_track_plot[[4]]
+```
+```{r track rain in previous 2 weeks across latitude}
+spring_rain_14b_track_plot = track_plot_lon("spring_q10_rain_14", "spring_q50_rain_14", "spring_q90_rain_14", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "b) 14 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+spring_rain_14b_track_plot[[1]]
+spring_rain_14b_track_plot[[2]]
+spring_rain_14b_track_plot[[3]]
+spring_rain_14b_track_mat = spring_rain_14b_track_plot[[4]]
+```
+
+```{r track rain in previous 3 weeks across latitude}
+spring_rain_21_track_plot = track_plot_lon("spring_q10_rain_21", "spring_q50_rain_21", "spring_q90_rain_21", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "c) 21 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+spring_rain_21_track_plot[[1]]
+spring_rain_21_track_plot[[2]]
+spring_rain_21_track_plot[[3]]
+spring_rain_21_track_mat = spring_rain_21_track_plot[[4]]
+```
+
+```{r track rain in previous 4 weeks across latitude}
+spring_rain_28_track_plot = track_plot_lon("spring_q10_rain_28", "spring_q50_rain_28", "spring_q90_rain_28", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "d) 28 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+spring_rain_28_track_plot[[1]]
+spring_rain_28_track_plot[[2]]
+spring_rain_28_track_plot[[3]]
+spring_rain_28_track_mat = spring_rain_28_track_plot[[4]]
+```
+
+```{r track rain in previous 1 week across latitude}
+fall_rain_7_track_plot = track_plot_lon("fall_q10_rain_7", "fall_q50_rain_7", "fall_q90_rain_7", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "e) 7 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+fall_rain_7_track_plot[[1]]
+fall_rain_7_track_plot[[2]]
+fall_rain_7_track_plot[[3]]
+fall_rain_7_track_mat = fall_rain_7_track_plot[[4]]
+```
+
+```{r track rain in previous 2 weeks across latitude}
+fall_rain_14b_track_plot = track_plot_lon("fall_q10_rain_14", "fall_q50_rain_14", "fall_q90_rain_14", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "f) 14 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+fall_rain_14b_track_plot[[1]]
+fall_rain_14b_track_plot[[2]]
+fall_rain_14b_track_plot[[3]]
+fall_rain_14b_track_mat = fall_rain_14b_track_plot[[4]]
+```
+
+```{r track rain in previous 3 week across latitude}
+fall_rain_21_track_plot = track_plot_lon("fall_q10_rain_21", "fall_q50_rain_21", "fall_q90_rain_21", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "g) 21 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+fall_rain_21_track_plot[[1]]
+fall_rain_21_track_plot[[2]]
+fall_rain_21_track_plot[[3]]
+fall_rain_21_track_mat = fall_rain_21_track_plot[[4]]
+```
+
+```{r track rain in previous 4 weeks across latitude}
+fall_rain_28_track_plot = track_plot_lon("fall_q10_rain_28", "fall_q50_rain_28", "fall_q90_rain_28", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "Mean rainfall (kg/m2)", "spring", "h) 28 days", FALSE, FALSE, start_at_0 = TRUE, FALSE)
+fall_rain_28_track_plot[[1]]
+fall_rain_28_track_plot[[2]]
+fall_rain_28_track_plot[[3]]
+fall_rain_28_track_mat = fall_rain_28_track_plot[[4]]
+```
+
+```{r make figure S3}
+
+plot_list = list(spring_rain_7_track_plot[[1]], fall_rain_7_track_plot[[1]], spring_rain_14b_track_plot[[1]], fall_rain_14b_track_plot[[1]], spring_rain_21_track_plot[[1]], fall_rain_21_track_plot[[1]], spring_rain_28_track_plot[[1]], fall_rain_28_track_plot[[1]])
+
+plot_list = lapply(plot_list, FUN = function(x) {x + ylim(0, 0.25)})
+
+left = textGrob(expression(paste("Rainfall (kg/m"^"2"*")")), 
+                  rot = 90, gp = gpar(fontsize = 10))
+bottom = textGrob("Latitude (°N)",  gp = gpar(fontsize = 10))
+grid.arrange(grobs = plot_list, ncol = 2, left = left, bottom = bottom)
+```
+
+```{r save figure S3}
+tiff(file = "FigS3.tiff", width = 173, height = 200, units = "mm", res = 600)
+grid.arrange(grobs = plot_list, ncol = 2, widths = unit(c(83,83), "mm"), left = left, bottom = bottom)
+dev.off()
+```
